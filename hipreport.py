@@ -744,36 +744,80 @@ def main():
 
     if env_mode == 'fake' and template_path and os.path.isfile(template_path):
         # ── Mode fake avec template XML édité par l'utilisateur ──────────
-        print(f'[HIP]   Mode       : FAKE (template : {template_path})',
-              file=sys.stderr)
         import re as _re
         with open(template_path) as f:
             report_xml = f.read()
-        now = datetime.now().strftime('%m/%d/%Y %H:%M:%S')
-        # Mettre à jour les champs dynamiques
-        def _upd(tag, val, xml):
-            return _re.sub(
-                rf'<{tag}>[^<]*</{tag}>',
-                f'<{tag}>{val}</{tag}>',
-                xml, count=1)
-        if client_ip:
-            report_xml = _upd('ip-address',    client_ip, report_xml)
-        if md5:
-            report_xml = _upd('md5-sum',       md5,       report_xml)
-        if username:
-            report_xml = _upd('user-name',     username,  report_xml)
-        report_xml = _upd('generate-time', now, report_xml)
-        print(f'[HIP] ✔ Template fake appliqué (ip={client_ip}, md5={md5[:8]}…)',
-              file=sys.stderr)
+        # Ancien format ProductInfo / PascalCase : non matché par les HIP
+        # Objects PAN-OS → bascule sur génération depuis la config.
+        legacy = (
+            '<ProductInfo' in report_xml
+            or '<Prod ' in report_xml
+            or 'name="AntiVirus"' in report_xml
+            or ('name="host-info"' not in report_xml
+                and 'name="antivirus"' not in report_xml)
+        )
+        if legacy:
+            print('[HIP]   Mode       : FAKE (template obsolète → '
+                  'génération format PAN-OS)', file=sys.stderr)
+            fake_overrides = {
+                'hostname':            cfg.get('hip_fake_hostname', ''),
+                'os_label':            cfg.get('hip_fake_os_label', ''),
+                'os_vendor':           cfg.get('hip_fake_os_vendor', 'Linux'),
+                'firewall':            cfg.get('hip_fake_firewall', True),
+                'firewall_name':       cfg.get('hip_fake_firewall_name', 'UFW'),
+                'antivirus':           cfg.get('hip_fake_antivirus', True),
+                'antivirus_vendor':    cfg.get('hip_fake_antivirus_vendor',
+                                               'Trend Micro, Inc.'),
+                'antivirus_name':      cfg.get('hip_fake_antivirus_name',
+                                               'Trend Micro Deep Security Agent'),
+                'antivirus_version':   cfg.get('hip_fake_antivirus_version',
+                                               '20.0.0.0000'),
+                'antivirus_defver':    cfg.get('hip_fake_antivirus_defver',
+                                               datetime.now().strftime('%Y%m%d')),
+                'antivirus_real_time': cfg.get('hip_fake_antivirus_real_time',
+                                               True),
+                'antivirus_last_scan': cfg.get(
+                    'hip_fake_antivirus_last_scan',
+                    datetime.now().strftime('%m/%d/%Y %H:%M:%S')),
+                'encryption':          cfg.get('hip_fake_encryption', True),
+                'mdm':                 cfg.get('hip_fake_mdm', True),
+                'mdm_name':            cfg.get('hip_fake_mdm_name',
+                                               'Microsoft Intune'),
+                'backup':              cfg.get('hip_fake_backup', False),
+                'backup_name':         cfg.get('hip_fake_backup_name',
+                                               'timeshift'),
+            }
+            if not fake_overrides['os_label']:
+                fake_overrides.pop('os_label')
+            report_xml = build_hip_report(
+                cookie, client_ip, md5, computer, '', username, ipv6,
+                fake_overrides=fake_overrides)
+        else:
+            print(f'[HIP]   Mode       : FAKE (template : {template_path})',
+                  file=sys.stderr)
+            now = datetime.now().strftime('%m/%d/%Y %H:%M:%S')
+            def _upd(tag, val, xml):
+                return _re.sub(
+                    rf'<{tag}>[^<]*</{tag}>',
+                    f'<{tag}>{val}</{tag}>',
+                    xml, count=1)
+            if client_ip:
+                report_xml = _upd('ip-address', client_ip, report_xml)
+            if md5:
+                report_xml = _upd('md5-sum', md5, report_xml)
+            if username:
+                report_xml = _upd('user-name', username, report_xml)
+            report_xml = _upd('generate-time', now, report_xml)
+            print(f'[HIP] ✔ Template fake appliqué '
+                  f'(ip={client_ip}, md5={md5[:8]}…)', file=sys.stderr)
     elif env_mode == 'fake' or hip_mode_cfg == 'fake':
         # ── Mode fake sans template : utiliser les valeurs de la config ──
-        # Valeurs par défaut : OS Linux + exemple d'antivirus courant.
         print('[HIP]   Mode       : FAKE (valeurs config)', file=sys.stderr)
         fake_overrides = {
             'hostname':            cfg.get('hip_fake_hostname', ''),
             'os_label':            cfg.get('hip_fake_os_label', ''),
             'os_vendor':           cfg.get('hip_fake_os_vendor', 'Linux'),
-            'firewall':            cfg.get('hip_fake_firewall', False),
+            'firewall':            cfg.get('hip_fake_firewall', True),
             'firewall_name':       cfg.get('hip_fake_firewall_name', 'UFW'),
             'antivirus':           cfg.get('hip_fake_antivirus', True),
             'antivirus_vendor':    cfg.get('hip_fake_antivirus_vendor',
@@ -795,7 +839,6 @@ def main():
             'backup':              cfg.get('hip_fake_backup', False),
             'backup_name':         cfg.get('hip_fake_backup_name', 'timeshift'),
         }
-        # os_label vide => calculé automatiquement depuis /etc/os-release
         if not fake_overrides['os_label']:
             fake_overrides.pop('os_label')
         report_xml = build_hip_report(
@@ -819,13 +862,28 @@ def main():
     # complet de la réponse PAN-OS (logs souvent muets en cas d'échec
     # côté HIP Object matching).
     if os.environ.get('GP_HIP_VERIFY_POST', '') == '1':
-        verify_server = (gateway
-                         or args.get('server', '')
-                         or cookie_fields.get('portal', ''))
-        cookie_str = cookie  # déjà URL-encodé tel que reçu d'openconnect
-        verify_post_to_gateway(
-            verify_server, cookie_str, client_ip, computer, report_xml,
-            verify=False)
+        # Hostname DNS uniquement — jamais le libellé portal du cookie
+        # (ex. "Office-Gateway-N") qui n'est pas résolvable.
+        def _is_host(h):
+            return bool(h) and ' ' not in h and '.' in h
+        verify_server = ''
+        for candidate in (
+                gateway,
+                os.environ.get('GP_HIP_GATEWAY', ''),
+                args.get('server', ''),
+                cfg.get('current_gateway', ''),
+                cfg.get('server', '')):
+            if _is_host(candidate):
+                verify_server = candidate
+                break
+        if not verify_server:
+            print('[HIP] verify-post ⚠ pas de hostname gateway utilisable '
+                  '— skip', file=sys.stderr)
+        else:
+            cookie_str = cookie
+            verify_post_to_gateway(
+                verify_server, cookie_str, client_ip, computer, report_xml,
+                verify=False)
 
     sys.exit(0)   # Toujours 0
 

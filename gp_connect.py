@@ -11,7 +11,7 @@ Application GTK3 qui intègre :
 """
 
 APP_ID      = 'com.gpconnect.app'
-APP_VERSION = '3.4.9'
+APP_VERSION = '3.5.1'
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -2315,31 +2315,234 @@ def _resolve_gateway_hostname(preferred, server, gateways=None):
     return server or None
 
 
+def _primary_uplink_iface():
+    """Interface uplink (route vers Internet), hors tunnels VPN."""
+    try:
+        out = subprocess.run(
+            ['ip', 'route', 'get', '1.1.1.1'],
+            check=False, capture_output=True, text=True, timeout=2).stdout
+        parts = out.split()
+        if 'dev' in parts:
+            idx = parts.index('dev')
+            if idx + 1 < len(parts):
+                iface = parts[idx + 1]
+                if not iface.startswith(('tun', 'gpd', 'ppp', 'wg')):
+                    return iface
+    except Exception:
+        pass
+    return ''
+
+
+def _iface_dns_servers(iface):
+    """Serveurs DNS IPv4 configurés sur une interface (resolvectl)."""
+    if not iface:
+        return []
+    tool, path = _detect_dns_tool()
+    if not path or tool not in ('resolvectl', 'systemd-resolve'):
+        return []
+    try:
+        out = subprocess.run(
+            [path, 'status', iface],
+            capture_output=True, text=True, timeout=3).stdout
+        import re as _re
+        servers = []
+        for m in _re.finditer(r'DNS Servers?:\s*(.+)', out):
+            for tok in m.group(1).split():
+                # IPv4 uniquement
+                if tok.count('.') == 3 and tok not in servers:
+                    servers.append(tok)
+        return servers
+    except Exception:
+        return []
+
+
+def _dns_query_a(hostname, nameserver, timeout=2.0):
+    """Résout les A records via un serveur DNS précis (bypass stub/VPN).
+
+    Utilise dig/host si dispo, sinon requête DNS UDP minimale.
+    """
+    if not hostname or not nameserver:
+        return []
+    # 1) dig
+    dig = shutil.which('dig')
+    if dig:
+        try:
+            out = subprocess.run(
+                [dig, f'@{nameserver}', hostname, 'A',
+                 '+short', '+time=2', '+tries=1', '+nosearch'],
+                capture_output=True, text=True, timeout=timeout + 1)
+            ips = []
+            for line in (out.stdout or '').splitlines():
+                line = line.strip()
+                if line.count('.') == 3 and not line.endswith('.'):
+                    try:
+                        ipaddress.ip_address(line)
+                        ips.append(line)
+                    except ValueError:
+                        pass
+            if ips:
+                return ips
+        except Exception:
+            pass
+    # 2) host
+    host_bin = shutil.which('host')
+    if host_bin:
+        try:
+            out = subprocess.run(
+                [host_bin, '-t', 'A', '-W', str(int(timeout)),
+                 hostname, nameserver],
+                capture_output=True, text=True, timeout=timeout + 1)
+            import re as _re
+            ips = _re.findall(
+                r'has address\s+(\d+\.\d+\.\d+\.\d+)', out.stdout or '')
+            if ips:
+                return ips
+        except Exception:
+            pass
+    # 3) Requête DNS UDP minimale (A)
+    try:
+        import struct, random
+        txid = random.randint(0, 65535)
+        # Header + QNAME + QTYPE A + QCLASS IN
+        labels = hostname.strip('.').encode('idna').split(b'.')
+        qname = b''.join(bytes([len(l)]) + l for l in labels) + b'\x00'
+        packet = struct.pack('!HHHHHH', txid, 0x0100, 1, 0, 0, 0)
+        packet += qname + struct.pack('!HH', 1, 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(packet, (nameserver, 53))
+            data, _ = sock.recvfrom(512)
+        finally:
+            sock.close()
+        if len(data) < 12 or struct.unpack('!H', data[:2])[0] != txid:
+            return []
+        ancount = struct.unpack('!H', data[6:8])[0]
+        # Skip question
+        pos = 12
+        while pos < len(data) and data[pos] != 0:
+            pos += 1 + data[pos]
+        pos += 5  # zero + type + class
+        ips = []
+        for _ in range(ancount):
+            if pos >= len(data):
+                break
+            # Name (possibly pointer)
+            if data[pos] & 0xC0 == 0xC0:
+                pos += 2
+            else:
+                while pos < len(data) and data[pos] != 0:
+                    pos += 1 + data[pos]
+                pos += 1
+            if pos + 10 > len(data):
+                break
+            rtype, _, _, rdlen = struct.unpack('!HHIH', data[pos:pos + 10])
+            pos += 10
+            if rtype == 1 and rdlen == 4 and pos + 4 <= len(data):
+                ips.append(socket.inet_ntoa(data[pos:pos + 4]))
+            pos += rdlen
+        return ips
+    except Exception:
+        return []
+
+
+def _resolve_portal_via_uplink(hostname, log_fn=None):
+    """Résout le portail via le DNS de l'uplink (jamais via tun/VPN).
+
+    Indispensable : si un tunnel est encore monté (DNS Domain ~. sur tun0),
+    le résolveur système renvoie l'IP privée interne → faux positif LAN.
+    """
+    _log = log_fn or (lambda m: None)
+    uplink = _primary_uplink_iface()
+    servers = _iface_dns_servers(uplink) if uplink else []
+    # Fallback : DNS des ifaces non-tunnel via status global
+    if not servers:
+        tool, path = _detect_dns_tool()
+        if path and tool in ('resolvectl', 'systemd-resolve'):
+            try:
+                out = subprocess.run(
+                    [path, 'status'],
+                    capture_output=True, text=True, timeout=5).stdout
+                import re as _re
+                for m in _re.finditer(
+                        r'Link \d+ \((?!lo|tun|gpd|ppp|wg|docker|br-|virbr)'
+                        r'([^)]+)\)(.*?)(?=Link \d+|\Z)', out, _re.S):
+                    block = m.group(2)
+                    dm = _re.search(r'DNS Servers?:\s*(.+)', block)
+                    if not dm:
+                        continue
+                    for tok in dm.group(1).split():
+                        if tok.count('.') == 3 and tok not in servers:
+                            servers.append(tok)
+            except Exception:
+                pass
+
+    if not servers:
+        _log('  [Auto/DNS] Aucun DNS uplink trouvé — fallback résolveur système')
+        return None
+
+    _log(f'  [Auto/DNS] Résolution via uplink'
+         f'{f" ({uplink})" if uplink else ""} '
+         f'DNS={", ".join(servers[:3])}')
+    for ns in servers[:4]:
+        ips = _dns_query_a(hostname, ns, timeout=2.0)
+        if ips:
+            return ips
+        _log(f'  [Auto/DNS] @{ns} : pas de réponse A pour {hostname}')
+    return []
+
+
 def _detect_lan_by_dns(hostname, log_fn=None):
-    """Détecte le réseau via la résolution DNS d'un hostname (portail VPN).
+    """Détecte le réseau via la résolution DNS du portail VPN.
 
-    Critère unique pour le mode Auto :
-      - True  : au moins une IP privée RFC 1918 → sur le LAN (sans tunnel)
-      - False : uniquement des IP publiques → hors LAN (tunnel requis)
-      - None  : résolution DNS impossible → traité comme hors LAN
+    Critère : résolution via le DNS de l'**uplink** (Wi-Fi/Ethernet),
+    jamais via le DNS du tunnel VPN (qui renverrait toujours l'IP privée
+    interne une fois le tunnel monté).
 
-    Sur le LAN d'entreprise, le DNS interne résout le portail
-    (ex. vpn.company.com) en adresse privée ; hors site, le DNS public
-    renvoie l'adresse publique du portail.
+      - True  : IP privée RFC 1918 → sur le LAN (sans tunnel)
+      - False : IP publique → hors LAN (tunnel requis)
+      - None  : résolution impossible → traité comme hors LAN
     """
     _log = log_fn or (lambda m: None)
     if not hostname:
         return None
-    try:
-        infos = socket.getaddrinfo(hostname, None, socket.AF_INET,
-                                   socket.SOCK_STREAM)
-        ips = sorted({info[4][0] for info in infos})
-    except socket.gaierror:
-        _log(f'  [Auto/DNS] {hostname} : résolution DNS échouée')
-        return None
+
+    ips = _resolve_portal_via_uplink(hostname, log_fn=_log)
+    if ips is None:
+        # Pas de DNS uplink : dernier recours = getaddrinfo, mais on
+        # refuse de conclure "LAN" si un tunnel DNS est actif.
+        tun_dns_active = False
+        try:
+            tool, path = _detect_dns_tool()
+            if path and tool in ('resolvectl', 'systemd-resolve'):
+                out = subprocess.run(
+                    [path, 'status'],
+                    capture_output=True, text=True, timeout=3).stdout
+                import re as _re
+                for m in _re.finditer(
+                        r'Link \d+ \((tun\d+|gpd\d+)\)(.*?)(?=Link \d+|\Z)',
+                        out, _re.S):
+                    block = m.group(2)
+                    if 'DNS Domain: ~.' in block or 'Default Route: yes' in block:
+                        tun_dns_active = True
+                        break
+        except Exception:
+            pass
+        if tun_dns_active:
+            _log('  [Auto/DNS] Tunnel DNS actif (tun/~.) sans DNS uplink '
+                 'fiable → hors LAN (tunnel requis)')
+            return False
+        try:
+            infos = socket.getaddrinfo(hostname, None, socket.AF_INET,
+                                       socket.SOCK_STREAM)
+            ips = sorted({info[4][0] for info in infos})
+            _log(f'  [Auto/DNS] Fallback système → {", ".join(ips)}')
+        except socket.gaierror:
+            _log(f'  [Auto/DNS] {hostname} : résolution DNS échouée')
+            return None
 
     if not ips:
-        _log(f'  [Auto/DNS] {hostname} : aucune adresse IPv4')
+        _log(f'  [Auto/DNS] {hostname} : aucune adresse IPv4 via uplink')
         return None
 
     private = [ip for ip in ips if _is_rfc1918(ip)]
@@ -2347,12 +2550,12 @@ def _detect_lan_by_dns(hostname, log_fn=None):
         shown = ', '.join(private)
         _log(
             f'  [Auto/DNS] {hostname} → {shown} '
-            f'(IP privée → réseau interne, sans tunnel)')
+            f'(IP privée uplink → réseau interne, sans tunnel)')
         return True
     shown = ', '.join(ips)
     _log(
         f'  [Auto/DNS] {hostname} → {shown} '
-        f'(IP publique → hors LAN, tunnel requis)')
+        f'(IP publique uplink → hors LAN, tunnel requis)')
     return False
 
 
@@ -2364,11 +2567,14 @@ def _has_rfc1918_interface():
     avec une sonde réseau pour conclure.
     """
     try:
-        import subprocess
         out = subprocess.run(
             ['ip', '-4', '-o', 'addr', 'show', 'scope', 'global'],
             capture_output=True, text=True, timeout=2)
         for line in (out.stdout or '').splitlines():
+            # Ignorer tunnels / docker / bridges
+            if any(x in line for x in (' tun', ' gpd', ' docker', ' br-',
+                                       ' virbr', ' veth')):
+                continue
             for tok in line.split():
                 if '/' in tok and tok.count('.') == 3:
                     ip = tok.split('/', 1)[0]
@@ -5672,45 +5878,94 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         out['os-vendor']      = _find(f'{hi_path}/os-vendor')
         out['client-version'] = _find(f'{hi_path}/client-version')
 
-        # Anti-Malware (1ère entrée seulement — la plus utilisée)
+        # Anti-Malware (1ère entrée) — format moderne OU ProductInfo legacy
         am = root.find('.//categories/entry[@name="anti-malware"]/list/entry')
         if am is None:
             am = root.find('.//categories/entry[@name="antivirus"]/list/entry')
+        if am is None:
+            am = root.find('.//categories/entry[@name="AntiVirus"]/list/entry')
         if am is not None:
-            out['av.vendor']      = (am.findtext('vendor') or '').strip()
-            out['av.name']        = (am.findtext('name') or '').strip()
-            out['av.version']     = (am.findtext('product-version') or '').strip()
-            out['av.real-time']   = (am.findtext('real-time-protection') or '').strip()
-            out['av.defver']      = (am.findtext('definition-version') or '').strip()
-            out['av.last-scan']   = (am.findtext('last-scan-time') or '').strip()
+            prod = am.find('.//Prod')
+            out['av.vendor'] = (am.findtext('vendor') or '').strip()
+            out['av.name'] = (
+                (am.findtext('name') or '').strip()
+                or (prod.get('name') if prod is not None else '')
+                or '')
+            out['av.version'] = (
+                (am.findtext('product-version') or '').strip()
+                or (prod.get('version') if prod is not None else '')
+                or '')
+            out['av.real-time'] = (
+                (am.findtext('real-time-protection') or '').strip()
+                or (am.findtext('.//real-time-protection') or '').strip())
+            out['av.defver'] = (
+                (am.findtext('definition-version') or '').strip()
+                or (prod.get('defver') if prod is not None else '')
+                or '')
+            out['av.last-scan'] = (
+                (am.findtext('last-scan-time') or '').strip()
+                or (am.findtext('.//last-full-scan-time') or '').strip())
+            out['av.installed'] = 'yes'
         else:
-            out['av.installed']   = 'no'
+            out['av.installed'] = 'no'
 
         fw = root.find('.//categories/entry[@name="firewall"]/list/entry')
+        if fw is None:
+            fw = root.find('.//categories/entry[@name="Firewall"]/list/entry')
         if fw is not None:
-            out['fw.name']        = (fw.findtext('name') or '').strip()
-            out['fw.status']      = (fw.findtext('status') or '').strip()
-            out['fw.vendor']      = (fw.findtext('vendor') or '').strip()
+            prod = fw.find('.//Prod')
+            out['fw.name'] = (
+                (fw.findtext('name') or '').strip()
+                or (prod.get('name') if prod is not None else '')
+                or '')
+            out['fw.status'] = (
+                (fw.findtext('status') or '').strip()
+                or (fw.findtext('is-enabled') or '').strip())
+            out['fw.vendor'] = (fw.findtext('vendor') or '').strip()
+            out['fw.installed'] = 'yes'
         else:
-            out['fw.installed']   = 'no'
+            out['fw.installed'] = 'no'
 
-        enc = root.find('.//categories/entry[@name="disk-encryption"]/list/entry')
+        enc = root.find(
+            './/categories/entry[@name="disk-encryption"]/list/entry')
+        if enc is None:
+            enc = root.find(
+                './/categories/entry[@name="Disk-Encryption"]/list/entry')
         if enc is not None:
-            out['enc.name']       = (enc.findtext('name') or '').strip()
-            out['enc.status']     = (enc.findtext('status') or '').strip()
+            prod = enc.find('.//Prod')
+            out['enc.name'] = (
+                (enc.findtext('name') or '').strip()
+                or (prod.get('name') if prod is not None else '')
+                or '')
+            out['enc.status'] = (enc.findtext('status') or '').strip() or 'yes'
+            out['enc.installed'] = 'yes'
         else:
-            out['enc.installed']  = 'no'
+            out['enc.installed'] = 'no'
 
-        mdm = root.find('.//categories/entry[@name="mobile-device-management"]/list/entry')
+        mdm = root.find(
+            './/categories/entry[@name="mobile-device-management"]/list/entry')
+        if mdm is None:
+            mdm = root.find(
+                './/categories/entry[@name="Mobile-Device-Management"]'
+                '/list/entry')
         if mdm is not None:
-            out['mdm.name']       = (mdm.findtext('name') or '').strip()
-            out['mdm.status']     = (mdm.findtext('status') or '').strip()
+            prod = mdm.find('.//Prod')
+            out['mdm.name'] = (
+                (mdm.findtext('name') or '').strip()
+                or (prod.get('name') if prod is not None else '')
+                or '')
+            out['mdm.status'] = (
+                (mdm.findtext('status') or '').strip()
+                or (mdm.findtext('is-enabled') or '').strip())
+            out['mdm.installed'] = 'yes'
         else:
-            out['mdm.installed']  = 'no'
+            out['mdm.installed'] = 'no'
 
-        # Compter les interfaces déclarées (info utile pour HIP Object réseau)
+        # Compter les interfaces (host-info ou racine legacy)
         ifaces = root.findall(
             './/categories/entry[@name="host-info"]/network-interface/entry')
+        if not ifaces:
+            ifaces = root.findall('.//network-interface/entry')
         out['network-interfaces'] = str(len(ifaces))
 
         return out
@@ -5915,7 +6170,7 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                 return
 
             server = target_host or self.config.get('server', '')
-            # ctx.gateway peut être vide ou un libellé portail (Lattes_Gateway-N)
+            # ctx.gateway peut être vide ou un libellé portail (Office-Gateway-N)
             # — ne l'utiliser que s'il ressemble à un hostname DNS.
             gw_ctx = ctx.get('gateway') or ''
             if _looks_like_hostname(gw_ctx):
@@ -6396,18 +6651,7 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
     @staticmethod
     def _primary_uplink_iface():
         """Retourne l'interface uplink primaire (route vers Internet)."""
-        try:
-            out = subprocess.run(
-                ['ip', 'route', 'get', '1.1.1.1'],
-                check=False, capture_output=True, text=True).stdout
-            parts = out.split()
-            if 'dev' in parts:
-                idx = parts.index('dev')
-                if idx + 1 < len(parts):
-                    return parts[idx + 1]
-        except Exception:
-            pass
-        return ''
+        return _primary_uplink_iface()
 
     def _ensure_uplink_dns_route(self):
         """Assure qu'au moins une interface LAN a default-route DNS=yes."""
@@ -6892,6 +7136,8 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         self._hip_stop_event   = None
         self._cached_is_internal = None
         self._cached_conn_mode = None
+        self._reusable_portal_cookie = None
+        self._tunnel_up_handled = False
         self.config.reload()
         if self._vpn_monitor_source:
             GLib.source_remove(self._vpn_monitor_source)
@@ -8345,11 +8591,11 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                 hip_verify = '1'
 
                 env_parts = [f'GP_HIP_CONTEXT_FILE="{hip_ctx_path}"',
-                             f'GP_HIP_VERIFY_POST={hip_verify}']
+                             f'GP_HIP_VERIFY_POST={hip_verify}',
+                             f'GP_HIP_GATEWAY="{target_host}"']
                 if template_path:
                     env_parts.insert(0, f'GP_HIP_TEMPLATE="{template_path}"')
                     env_parts.insert(0, 'GP_HIP_MODE=fake')
-                    self._log(f'HIP fake activé → template : {template_path}')
                 else:
                     self._log(f'HIP activé → {hip_script}')
                 env_lines = (
