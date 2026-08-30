@@ -1,0 +1,69 @@
+# ── Build & artefacts ──────────────────────────────────────────────
+# Les paquets historiques embarquent d'anciennes versions du code
+# (commentaires, exemples d'hôtes, IPs internes). Ne jamais publier.
+/build/
+/dist/
+*.deb
+*.rpm
+*.tar.gz
+*.tar.xz
+*.zip
+*.dsc
+*.asc
+
+# ── OpenConnect amont (dépendance système, pas le code de ce client)
+/openconnect-9.12/
+/openconnect_*.tar.gz
+/openconnect_*.tar.xz
+/openconnect_*.dsc
+/openconnect_*.asc
+
+# ── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env/
+*.egg
+
+# ── IDE / éditeurs ─────────────────────────────────────────────────
+# workspace.xml PhpStorm contient l'historique d'autres projets internes
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Secrets, config locale, sessions VPN ───────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.ovpn
+*.conf
+!*.desktop
+config.json
+*.token
+.vpn_state.json
+hip_template.xml
+
+# ── Logs & dumps ───────────────────────────────────────────────────
+*.log
+*.pcap
+*.pcapng
+core
+core.*
+
+# ── Captures pouvant montrer un réseau interne ─────────────────────
+docs/screenshot.png
+
+# ── OS ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
