@@ -11,7 +11,7 @@ Application GTK3 qui intègre :
 """
 
 APP_ID      = 'com.gpconnect.app'
-APP_VERSION = '3.5.1'
+APP_VERSION = '3.6.0'
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -59,6 +59,7 @@ import collections
 import configparser
 import ipaddress
 import json
+import re
 import time as _time_mod
 import os
 import shutil
@@ -244,16 +245,22 @@ def _read_token_file():
     return doc
 
 
+# Lectures-modifications-écritures du fichier token depuis plusieurs threads
+# (connexion, surveillance réseau) : sérialisées.
+_TOKEN_FILE_LOCK = threading.RLock()
+
+
 def _write_token_file(doc, log_fn=None):
     _log = log_fn or (lambda m: None)
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         # Écriture atomique pour éviter corruption en cas de crash
         tmp = _TOKEN_FILE.with_suffix(_TOKEN_FILE.suffix + '.tmp')
-        with open(tmp, 'w') as f:
-            json.dump(doc, f, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, _TOKEN_FILE)
+        with _TOKEN_FILE_LOCK:
+            with open(tmp, 'w') as f:
+                json.dump(doc, f, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, _TOKEN_FILE)
         return True
     except Exception as e:
         _log(f'  [Token] Écriture fichier erreur : {e}')
@@ -404,12 +411,14 @@ def _save_session_token(server, data, log_fn=None):
     keyring_ok = _keyring_store_sync(server, entry_json, log_fn=_log)
 
     # 2) Fichier : cache de secours. Mêmes données.
-    doc = _read_token_file() or {'v': 2, 'sessions': {}}
-    if 'sessions' not in doc or not isinstance(doc.get('sessions'), dict):
-        doc['sessions'] = {}
-    doc['sessions'][server] = entry
-    doc['v'] = 2
-    if _write_token_file(doc, log_fn=_log):
+    with _TOKEN_FILE_LOCK:
+        doc = _read_token_file() or {'v': 2, 'sessions': {}}
+        if 'sessions' not in doc or not isinstance(doc.get('sessions'), dict):
+            doc['sessions'] = {}
+        doc['sessions'][server] = entry
+        doc['v'] = 2
+        file_ok = _write_token_file(doc, log_fn=_log)
+    if file_ok:
         _log(f'  [Token] Cache fichier OK : {_TOKEN_FILE} '
              f'({len(doc["sessions"])} serveur(s))')
 
@@ -592,18 +601,19 @@ def _clear_session_token(server=None, log_fn=None):
     _log = log_fn or (lambda m: None)
     # Fichier
     if server:
-        doc = _read_token_file()
-        if doc and isinstance(doc.get('sessions'), dict):
-            doc['sessions'].pop(server, None)
-            if doc['sessions']:
-                _write_token_file(doc, log_fn=_log)
-                _log(f'  [Token] Fichier : session {server} supprimée')
-            else:
-                try:
-                    _TOKEN_FILE.unlink(missing_ok=True)
-                    _log('  [Token] Fichier supprimé (plus aucune session)')
-                except Exception:
-                    pass
+        with _TOKEN_FILE_LOCK:
+            doc = _read_token_file()
+            if doc and isinstance(doc.get('sessions'), dict):
+                doc['sessions'].pop(server, None)
+                if doc['sessions'] or doc.get('gateways'):
+                    _write_token_file(doc, log_fn=_log)
+                    _log(f'  [Token] Fichier : session {server} supprimée')
+                else:
+                    try:
+                        _TOKEN_FILE.unlink(missing_ok=True)
+                        _log('  [Token] Fichier supprimé (plus aucune session)')
+                    except Exception:
+                        pass
     else:
         for f in (_TOKEN_FILE, CONFIG_DIR / '.vpn_state.json'):
             try:
@@ -614,6 +624,310 @@ def _clear_session_token(server=None, log_fn=None):
 
     # Keyring
     _keyring_clear(server, log_fn=_log)
+
+
+# ─────────────────────────────────────────────
+#  Session passerelle (itinérance)
+#
+#  Une fois authentifié, openconnect détient un cookie de session
+#  passerelle (authcookie=…&portal=…&user=…&domain=…&computer=…). Tant que
+#  la passerelle n'a reçu aucun logout et n'a pas expiré la session, ce
+#  cookie suffit pour remonter un tunnel via `openconnect --cookie-on-stdin`
+#  — sans SAML ni prelogin-cookie. Stocké à part des tokens portail
+#  (keyring « <serveur>#gateway » + section « gateways » du fichier) pour
+#  ne pas être emporté par leurs purges.
+# ─────────────────────────────────────────────
+
+_GW_KEY_SUFFIX = '#gateway'
+_GW_FIELDS = ('cookie', 'host', 'url', 'resolve', 'desc', 'os_type',
+              'user_agent', 'username', 'client_ip', 'ts')
+
+
+def _gateway_session_load(server, log_fn=None):
+    """Retourne la session passerelle mémorisée pour `server`, ou None."""
+    _log = log_fn or (lambda m: None)
+    if not server:
+        return None
+    data = None
+    raw = _keyring_lookup(server + _GW_KEY_SUFFIX)
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = None
+    if not isinstance(data, dict):
+        doc = _read_token_file() or {}
+        gws = doc.get('gateways')
+        data = gws.get(server) if isinstance(gws, dict) else None
+    if (not isinstance(data, dict) or data.get('server') != server
+            or not data.get('cookie') or not data.get('host')):
+        return None
+    idle = _time_mod.time() - data.get('seen_ts', data.get('ts', 0))
+    if idle > _TOKEN_MAX_AGE:
+        _log(f'  [Session] Session passerelle {data["host"]} inutilisée '
+             f'depuis {int(idle // 3600)} h — ignorée')
+        _gateway_session_clear(server)
+        return None
+    return data
+
+
+def _gateway_session_save(server, session, log_fn=None):
+    """Mémorise la session passerelle (keyring + cache fichier)."""
+    _log = log_fn or (lambda m: None)
+    if not server or not session.get('cookie') or not session.get('host'):
+        return False
+    now = _time_mod.time()
+    entry = {k: session.get(k) or '' for k in _GW_FIELDS}
+    entry['server'] = server
+    entry['ts'] = session.get('ts') or now
+    entry['seen_ts'] = now
+    keyring_ok = _keyring_store_sync(server + _GW_KEY_SUFFIX,
+                                     json.dumps(entry))
+    with _TOKEN_FILE_LOCK:
+        doc = _read_token_file() or {'v': 2, 'sessions': {}}
+        if not isinstance(doc.get('sessions'), dict):
+            doc['sessions'] = {}
+        if not isinstance(doc.get('gateways'), dict):
+            doc['gateways'] = {}
+        doc['gateways'][server] = entry
+        doc['v'] = 2
+        file_ok = _write_token_file(doc, log_fn=_log)
+    if not keyring_ok:
+        _log('  [Session] ⚠ Keyring indisponible — session passerelle '
+             'en cache fichier uniquement')
+    return keyring_ok or file_ok
+
+
+def _gateway_session_clear(server, log_fn=None):
+    """Oublie la session passerelle mémorisée pour `server`."""
+    _log = log_fn or (lambda m: None)
+    if not server:
+        return
+    with _TOKEN_FILE_LOCK:
+        doc = _read_token_file()
+        if (doc and isinstance(doc.get('gateways'), dict)
+                and server in doc['gateways']):
+            doc['gateways'].pop(server, None)
+            _write_token_file(doc, log_fn=_log)
+    _keyring_clear(server + _GW_KEY_SUFFIX, log_fn=_log)
+
+
+# Messages openconnect (non traduits par le catalogue fr) signalant une
+# reconnexion interne en cours, puis son aboutissement côté ESP. En HTTPS
+# seul, aucun message ne confirme la reprise : la sonde DNS fait foi.
+_OC_RECONNECT_MARKERS = (
+    'Dead Peer Detection detected dead peer', 'ESP detected dead peer',
+    'Failed to connect ESP tunnel', 'remaining timeout',
+    'Packet receive error', 'GlobalProtect rekey due', 'Reconnect failed',
+)
+_OC_RECOVERED_MARKERS = ('ESP session established with server',
+                         'ESP tunnel connected')
+_OC_REJECTED_MARKERS = ('Cookie was rejected', 'Cookie is no longer valid',
+                        'Unexpected 512 result from server')
+# Délais (s) entre reprises successives de la session passerelle.
+_GW_RECOVERY_DELAYS = (2, 5, 10, 20, 30, 60)
+_GW_MAX_HARD_FAILURES = 3
+
+
+def _cookie_with_preferred_ip(cookie, ip):
+    """Ajoute preferred-ip au cookie (ce que fait openconnect en reconnexion)."""
+    parts = [p for p in (cookie or '').split('&')
+             if p and not p.startswith('preferred-ip=')]
+    if ip:
+        parts.append('preferred-ip=' + quote(ip, safe=''))
+    return '&'.join(parts)
+
+
+_SECRET_COOKIE_RE = re.compile(
+    r'((?:portal-userauthcookie|portal-prelogonuserauthcookie'
+    r'|prelogin-cookie|authcookie)=)[^&\s\'"]+', re.I)
+
+
+def _mask_secrets(text):
+    """Masque les valeurs de cookies de session (journal copiable)."""
+    if not text or 'cookie' not in text.lower():
+        return text
+    return _SECRET_COOKIE_RE.sub(r'\1***', text)
+
+
+_TUNNEL_IFACE_PREFIXES = ('tun', 'gpd', 'tap', 'ppp', 'wg', 'vpn')
+
+
+def _iface_ipv4(iface):
+    """IPv4 principale d'une interface (ioctl SIOCGIFADDR), ou ''."""
+    import fcntl
+    import struct
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        res = fcntl.ioctl(s.fileno(), 0x8915,
+                          struct.pack('256s', iface[:15].encode()))
+        return socket.inet_ntoa(res[20:24])
+    except OSError:
+        return ''
+    finally:
+        s.close()
+
+
+def _uplink_fingerprint():
+    """Identifie l'accès réseau physique courant : (famille, iface, gw, ip).
+
+    None si aucune route physique (pas de réseau). Route par défaut hors
+    tunnel en priorité ; sinon la meilleure route « via passerelle » hors
+    tunnel (cas d'un vpnc-script qui a remplacé la route par défaut et
+    laissé une route hôte vers la passerelle VPN). Lecture de /proc, sans
+    sous-processus : appelée toutes les quelques secondes.
+    """
+    import struct
+    best_default = None
+    best_gw = None
+    try:
+        with open('/proc/net/route') as f:
+            next(f, None)
+            for line in f:
+                p = line.split()
+                if len(p) < 8:
+                    continue
+                iface, dest, gw, mask = p[0], p[1], p[2], p[7]
+                flags, metric = int(p[3], 16), int(p[6])
+                if not flags & 0x1 or iface == 'lo' \
+                        or iface.startswith(_TUNNEL_IFACE_PREFIXES):
+                    continue
+                gw_ip = socket.inet_ntoa(struct.pack('<I', int(gw, 16)))
+                cand = (metric, iface, gw_ip)
+                if dest == '00000000' and mask == '00000000':
+                    if best_default is None or cand < best_default:
+                        best_default = cand
+                elif flags & 0x2:
+                    if best_gw is None or cand < best_gw:
+                        best_gw = cand
+    except Exception:
+        pass
+    best = best_default or best_gw
+    if best:
+        return ('ipv4', best[1], best[2], _iface_ipv4(best[1]))
+    try:
+        with open('/proc/net/ipv6_route') as f:
+            for line in f:
+                p = line.split()
+                if len(p) < 10 or p[0] != '0' * 32 or p[1] != '00':
+                    continue
+                flags = int(p[8], 16)
+                iface = p[9]
+                if (not flags & 0x1 or flags & 0x200 or iface == 'lo'
+                        or iface.startswith(_TUNNEL_IFACE_PREFIXES)):
+                    continue
+                return ('ipv6', iface, p[4], '')
+    except Exception:
+        pass
+    return None
+
+
+def _describe_uplink(fp):
+    if not fp:
+        return 'aucun'
+    _fam, iface, gw, ip = fp
+    return f'{iface} ({ip or "?"} via {gw})' if ip else f'{iface} (via {gw})'
+
+
+def _suspended_seconds():
+    """Temps cumulé passé en veille depuis le boot (BOOTTIME − MONOTONIC)."""
+    try:
+        return (_time_mod.clock_gettime(_time_mod.CLOCK_BOOTTIME)
+                - _time_mod.clock_gettime(_time_mod.CLOCK_MONOTONIC))
+    except Exception:
+        return 0.0
+
+
+def _dns_server_responds(nameserver, qname, timeout=2.0):
+    """True si `nameserver` répond (peu importe le code) à une requête A."""
+    import random
+    import struct
+    try:
+        ipaddress.IPv4Address(nameserver)
+    except ValueError:
+        return False
+    try:
+        labels = (qname or 'localhost').strip('.').encode('idna').split(b'.')
+    except UnicodeError:
+        labels = [b'localhost']
+    txid = random.randint(0, 0xFFFF)
+    pkt = struct.pack('>HHHHHH', txid, 0x0100, 1, 0, 0, 0)
+    pkt += b''.join(bytes([len(l)]) + l for l in labels if l) + b'\x00'
+    pkt += struct.pack('>HH', 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((nameserver, 53))
+        s.send(pkt)
+        deadline = _time_mod.monotonic() + timeout
+        while True:
+            left = deadline - _time_mod.monotonic()
+            if left <= 0:
+                return False
+            s.settimeout(left)
+            data = s.recv(4096)
+            if (len(data) >= 4 and struct.unpack('>H', data[:2])[0] == txid
+                    and data[2] & 0x80):
+                return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _route_dev(ip):
+    """Interface de sortie vers `ip` selon la table de routage, ou ''."""
+    try:
+        out = subprocess.run(['ip', 'route', 'get', ip],
+                             capture_output=True, text=True, timeout=2).stdout
+        m = re.search(r'\bdev\s+(\S+)', out)
+        return m.group(1) if m else ''
+    except Exception:
+        return ''
+
+
+def _tcp_reachable(host, timeout=4.0):
+    """True si une connexion TCP vers host[:port] (443 par défaut) aboutit."""
+    name, port = host, 443
+    if host.count(':') == 1:
+        name, _, p = host.partition(':')
+        try:
+            port = int(p)
+        except ValueError:
+            name, port = host, 443
+    try:
+        with socket.create_connection((name, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ppid_of(pid):
+    """PID parent (via /proc, lisible pour un processus root), ou None."""
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return int(f.read().rsplit(')', 1)[1].split()[1])
+    except Exception:
+        return None
+
+
+def _pid_alive(pid, name='openconnect'):
+    """True si `pid` existe (et porte le nom `name`, contre la réutilisation
+    de PID). EPERM = processus root vivant, non signalable sans sudo."""
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass
+    except (ProcessLookupError, TypeError, ValueError, OverflowError):
+        return False
+    if name:
+        try:
+            with open(f'/proc/{pid}/comm') as f:
+                return f.read().strip() == name
+        except OSError:
+            return False
+    return True
+
 
 def _resolve_hip_script_builtin():
     """Trouve hipreport.py selon le mode d'installation.
@@ -4510,6 +4824,18 @@ class MainWindow(Gtk.ApplicationWindow):
         self._vpn_iface        = ''
         self._vpn_client_ip    = ''
         self._vpn_dns_servers  = []
+        # Itinérance : session passerelle réutilisable sans SAML, reprise
+        # automatique après coupure et surveillance veille / changement réseau.
+        self._gw_session       = None   # dict (cookie, host, …) de la session tunnel courante
+        self._oc_phase         = None   # 'auth' | 'tunnel' | 'single' | 'cookie' (openconnect en cours)
+        self._oc_call          = None   # jeton de l'appel _do_connect courant
+        self._oc_reconnecting  = False  # openconnect a signalé une reconnexion interne
+        self._recovery_gen     = 0      # incrémenté à chaque annulation (invalide les reprises en attente)
+        self._gw_recovery_attempt = 0   # tentatives de reprise consécutives (backoff)
+        self._gw_hard_failures = 0      # échecs de reprise avec passerelle joignable
+        self._tunnel_up_mono   = 0.0    # instant (monotonic) de la dernière montée du tunnel
+        self._netmon_pending   = None   # événement réseau en cours de traitement
+        self._dns_reassert_lock = threading.Lock()
         self._quitting = False
         self.tray_icon = None
         self.tray_menu = None
@@ -4526,6 +4852,7 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add(600, self._detect_existing_vpn)
         GLib.timeout_add(1100, self._check_sudo_setup_on_startup)
         GLib.timeout_add(2000, self._auto_reconnect_on_startup)
+        threading.Thread(target=self._netmon_loop, daemon=True).start()
 
     # ── Interface ──────────────────────────────────────────────────────────
 
@@ -6382,7 +6709,8 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         else:
             self._cancel()
 
-    def _cancel(self, kill_tunnel=False, logout_internal=False):
+    def _cancel(self, kill_tunnel=False, logout_internal=False,
+                keep_gateway_session=False):
         """Annule / déconnecte la session courante.
 
         Paramètres :
@@ -6394,11 +6722,19 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                              à l'action « Oublier la session ». Par défaut
                              on coupe juste le HIP keepalive pour préserver
                              le token réutilisable.
+          keep_gateway_session — True pour couper le tunnel par SIGHUP :
+                             openconnect sort SANS logout.esp, la session
+                             passerelle reste valide et la prochaine
+                             connexion reprend sans SAML. Sinon SIGTERM
+                             (logout côté passerelle).
         """
         self._cancel_requested = True
+        self._recovery_gen += 1
+        self._netmon_pending = None
         if self._vpn_monitor_source:
             GLib.source_remove(self._vpn_monitor_source)
             self._vpn_monitor_source = None
+        adopted_pid = self._existing_vpn_pid
         self._existing_vpn_pid = None
         if self._internal_session:
             if logout_internal:
@@ -6412,18 +6748,34 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                 if stop_ev:
                     stop_ev.set()
                 self._internal_session = None
+        proc = self.openconnect_proc
+        proc_alive = proc is not None and proc.poll() is None
+        # Interrompre une reprise par cookie passerelle ne doit pas fermer
+        # la session côté serveur (SIGTERM ⇒ logout.esp).
+        detach = keep_gateway_session or (
+            not kill_tunnel and self._oc_phase == 'cookie')
         if kill_tunnel:
             self._restore_dns_routes()
-            if self.openconnect_proc and self.openconnect_proc.poll() is None:
+        if detach:
+            if proc_alive or (kill_tunnel and adopted_pid):
+                threading.Thread(
+                    target=self._detach_openconnect,
+                    args=(proc if proc_alive else None,
+                          None if proc_alive else adopted_pid),
+                    daemon=True).start()
+        elif kill_tunnel:
+            if proc_alive:
                 try:
-                    self.openconnect_proc.terminate()
+                    proc.terminate()
                 except Exception:
                     pass
             threading.Thread(target=self._kill_all_openconnect, daemon=True).start()
+            if proc_alive or adopted_pid:
+                self._forget_gateway_session()
         else:
-            if self.openconnect_proc and self.openconnect_proc.poll() is None:
+            if proc_alive:
                 try:
-                    self.openconnect_proc.terminate()
+                    proc.terminate()
                 except Exception:
                     pass
         self._set_state('disconnected')
@@ -6452,9 +6804,16 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         cookie / authcookie interne) reste sur disque et reste valide côté
         serveur, ce qui permet à la prochaine connexion de reprendre sans
         repasser par SAML tant que le token n'a pas expiré.
+
+        openconnect est arrêté par SIGHUP (détachement, pas de logout.esp) :
+        la session passerelle reste valide pour une reprise sans SAML.
         """
         self._log('Déconnexion du tunnel VPN (session conservée)…')
-        self._cancel(kill_tunnel=True, logout_internal=False)
+        if self._gw_session:
+            _gateway_session_save(self.config.get('server', ''),
+                                  self._gw_session)
+        self._cancel(kill_tunnel=True, logout_internal=False,
+                     keep_gateway_session=True)
 
     def _disconnect_and_forget(self):
         """Déconnexion + suppression du token du serveur courant.
@@ -6468,21 +6827,22 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         # Par sécurité, on efface uniquement le token du serveur courant —
         # les autres serveurs VPN éventuellement utilisés restent intacts.
         _clear_session_token(server or None, log_fn=self._log)
+        self._forget_gateway_session(server)
         self._reconnect_count = 99
         self._cancel(kill_tunnel=True, logout_internal=True)
 
     def _auto_reconnect_on_startup(self):
-        """Auto-reconnexion au démarrage avec token sauvegardé."""
+        """Auto-reconnexion au démarrage avec token sauvegardé.
+
+        _start_connect() tente dans l'ordre : session passerelle mémorisée,
+        token portail réutilisable, puis SAML.
+        """
         if self.state != 'disconnected':
             return False
         server = self.config.get('server', '')
         if not server:
             return False
-        self._set_state('authenticating')
         self._reconnect_count = 0
-        if self._try_reuse_session():
-            return False
-        self._log('  [Session] Reconnexion — auth SAML via WebView…')
         self._start_connect()
         return False
 
@@ -6656,9 +7016,13 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
     def _ensure_uplink_dns_route(self):
         """Assure qu'au moins une interface LAN a default-route DNS=yes."""
         routes = self._parse_default_routes()
-        if any(routes.values()):
+        fp = _uplink_fingerprint()
+        current = fp[1] if fp else ''
+        # Après un changement de réseau, l'accès courant peut être resté à
+        # « no » (forcé pendant le tunnel) alors qu'un ancien lien est à « yes ».
+        if any(routes.values()) and routes.get(current) is not False:
             return True
-        uplink = self._primary_uplink_iface()
+        uplink = current or self._primary_uplink_iface()
         if not uplink:
             self._log('  [DNS] ⚠ Impossible de détecter l’interface uplink.')
             return False
@@ -6964,12 +7328,8 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
             self._vpn_monitor_source = None
             return False
         pid = self._existing_vpn_pid
-        if pid:
-            try:
-                os.kill(pid, 0)  # signal 0 = test d'existence
-                return True      # toujours actif
-            except (ProcessLookupError, PermissionError):
-                pass
+        if pid and _pid_alive(pid):
+            return True      # toujours actif
         # Processus disparu
         self._existing_vpn_pid   = None
         self._vpn_monitor_source = None
@@ -7122,7 +7482,7 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
 
     # ── Flux de connexion ──────────────────────────────────────────────────
 
-    def _start_connect(self):
+    def _start_connect(self, use_gateway_session=True):
         self._cancel_requested   = False
         self._existing_vpn_pid   = None
         self._mode_retry_attempted = False
@@ -7145,10 +7505,73 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         self.log_buf.set_text('')
         self._set_state('authenticating')
         self._log('=== Démarrage connexion GP Connect ===')
-        # Tenter la réutilisation d'un token sauvegardé
+        # 1) Session passerelle encore ouverte → tunnel sans aucune auth
+        if use_gateway_session and self._try_resume_gateway_session():
+            return
+        self._continue_auth_flow()
+
+    def _continue_auth_flow(self):
+        """Token portail réutilisable, sinon authentification SAML."""
         if self._try_reuse_session():
             return
         threading.Thread(target=self._auth_thread, daemon=True).start()
+
+    def _try_resume_gateway_session(self):
+        """Relance le tunnel avec la session passerelle mémorisée (sans SAML).
+
+        Retourne True si une tentative est lancée ; en cas d'échec elle
+        bascule d'elle-même sur le flux normal (_continue_auth_flow).
+        """
+        server = self.config.get('server', '')
+        mode = self._forced_conn_mode or self.config.get(
+            'connection_mode', 'auto')
+        if not server or mode == 'internal':
+            return False
+        gw = _gateway_session_load(server, log_fn=self._log)
+        if not gw:
+            return False
+        self._gw_session = gw
+        self._gw_recovery_attempt = 0
+        self._gw_hard_failures = 0
+        gen = self._recovery_gen
+        self._set_state('connecting',
+                        subtitle=f'Reprise session {gw.get("desc") or gw["host"]}…')
+
+        def _run():
+            if mode == 'auto' and _is_on_internal_network(
+                    server, log_fn=self._log):
+                self._log('  [Session] Réseau interne détecté — session '
+                          'passerelle conservée pour plus tard')
+                if gen == self._recovery_gen and not self._cancel_requested:
+                    self._continue_auth_flow()
+                return
+            if gen != self._recovery_gen or self._cancel_requested:
+                return
+            self._connect_with_gateway_session(gw)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+
+    def _connect_with_gateway_session(self, gw):
+        # La session vit sur la passerelle jointe à l'origine (--resolve,
+        # comme le fait openconnect en reconnexion interne). Abandonner
+        # l'IP mémorisée seulement si le DNS ne la renvoie plus.
+        resolve = gw.get('resolve') or ''
+        name, _, pinned = resolve.partition(':')
+        if pinned:
+            try:
+                ips = {i[4][0] for i in socket.getaddrinfo(
+                    name, 443, proto=socket.IPPROTO_TCP)}
+            except OSError:
+                ips = set()
+            if ips and pinned not in ips:
+                self._log(f'  [Session] {name} ne résout plus vers {pinned} '
+                          f'({", ".join(sorted(ips))}) — IP non imposée')
+                gw = dict(gw, resolve='')
+                self._gw_session = gw
+        self._do_connect(gw['host'], gw.get('desc') or gw['host'], '', '',
+                         gw.get('username', ''), gw.get('os_type', ''),
+                         gw.get('user_agent', ''), gw_session=gw)
 
     def _try_reuse_session(self):
         """Tente de réutiliser un token de session sauvegardé.
@@ -7882,8 +8305,11 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
 
         if not gateways:
             self._log('Aucun gateway trouvé — connexion directe au portail.')
-            GLib.idle_add(self._do_connect, server, '', gw_cookie_field,
-                          gw_cookie_value, username, os_type, user_agent, True)
+            threading.Thread(
+                target=self._do_connect,
+                args=(server, '', gw_cookie_field, gw_cookie_value,
+                      username, os_type, user_agent, True),
+                daemon=True).start()
             return False
 
         # Lister les gateways dispos pour aider au diagnostic
@@ -8472,11 +8898,18 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
             self._log(f'ℹ️  Mode mémorisé pour {server} : {mode}')
 
     def _do_connect(self, target_host, gateway_desc, cookie_field, cookie_value,
-                    username, os_type, user_agent, use_portal_stdin=False):
+                    username, os_type, user_agent, use_portal_stdin=False,
+                    gw_session=None):
         """Lance openconnect vers le gateway (avec portal-userauthcookie).
 
         use_portal_stdin=True : fallback — connexion via portail + sélection stdin.
-        use_portal_stdin=False : connexion directe au gateway (cas nominal).
+        use_portal_stdin=False : connexion directe au gateway (cas nominal),
+            en deux temps : `openconnect --authenticate` (login passerelle,
+            imprime le cookie de session) puis `openconnect --cookie-on-stdin`
+            (tunnel). Le cookie de session est mémorisé pour relancer le
+            tunnel sans SAML après une coupure (veille, changement réseau).
+        gw_session : reprise d'une session passerelle mémorisée (tunnel
+            direct avec son cookie, aucune authentification).
         """
         # Vérifier sudo avant de continuer
         if not can_sudo_openconnect():
@@ -8491,8 +8924,18 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         # _retry_with_portal_mode / _retry_with_gateway_direct qui ne repasse
         # pas par _start_connect.
         self._oc_512_terminated = False
+        self._oc_reconnecting = False
+        _my_call = object()
+        self._oc_call = _my_call
+        _my_hip_wrapper = None
 
-        if use_portal_stdin:
+        if gw_session:
+            use_portal_stdin = False
+            usergroup = ''
+            self._set_state('connecting', subtitle=gateway_desc or target_host)
+            self._log(f'Reprise de la session passerelle → {gateway_desc} '
+                      f'({target_host}) — sans SAML')
+        elif use_portal_stdin:
             usergroup = f'portal:{cookie_field}'
             self._set_state('connecting', subtitle=gateway_desc or target_host)
             self._log(
@@ -8502,6 +8945,11 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
             usergroup = f'gateway:{cookie_field}'
             self._set_state('connecting', subtitle=gateway_desc)
             self._log(f'Connexion → gateway {gateway_desc} ({target_host})')
+        if not gw_session:
+            # Nouvelle authentification : l'ancienne session est remplacée.
+            self._gw_session = None
+            self._gw_recovery_attempt = 0
+            self._gw_hard_failures = 0
 
         allow_insecure = self.config.get('allow_insecure_crypto', False)
 
@@ -8529,20 +8977,26 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
         elif cookie_field in _REFRESH_FIELDS:
             self._last_auth_info['refresh_field'] = cookie_field
             self._last_auth_info['refresh_value'] = cookie_value
+        if gw_session:
+            # Rien de neuf à persister côté tokens portail.
+            self._last_auth_info = {}
 
         self._tunnel_up_handled = False
 
-        cmd = [
+        base_cmd = [
             'sudo', '-n', 'openconnect',
             '--protocol=gp',
             f'--os={os_type}',
-            f'--user={username}',
-            f'--usergroup={usergroup}',
             f'--useragent={user_agent}',
-            '--passwd-on-stdin',
         ]
         if allow_insecure:
-            cmd.append('--allow-insecure-crypto')
+            base_cmd.append('--allow-insecure-crypto')
+        auth_opts = [
+            f'--user={username}',
+            f'--usergroup={usergroup}',
+            '--passwd-on-stdin',
+        ]
+        hip_opts = []
 
         # Sauvegarder le gateway courant pour le script HIP
         self.config.set('current_gateway', target_host)
@@ -8634,17 +9088,20 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                 tf.close()
                 os.chmod(tf.name, _stat.S_IRWXU | _stat.S_IRGRP | _stat.S_IXGRP)
                 self._hip_wrapper_tmp = tf.name
-                cmd += [f'--csd-wrapper={tf.name}']
+                _my_hip_wrapper = tf.name
+                hip_opts = [f'--csd-wrapper={tf.name}']
             else:
                 self._log('⚠ HIP activé mais script introuvable — désactivé.')
         else:
             self._log('  [HIP] Désactivé dans les paramètres — pas de csd-wrapper')
 
-        cmd.append(target_host)
-        self._log('$ ' + ' '.join(cmd))
+        def _tunnel_cmd(host, extra=()):
+            return (base_cmd + ['--cookie-on-stdin', *extra]
+                    + hip_opts + [host])
 
-        try:
-            self.openconnect_proc = subprocess.Popen(
+        def _spawn(cmd, stdin_line, keep_stdin_open=False):
+            self._log('$ ' + ' '.join(cmd))
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -8652,21 +9109,49 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                 text=True,
                 bufsize=1,
             )
+            self.openconnect_proc = proc
+            proc.stdin.write(stdin_line + '\n')
+            proc.stdin.flush()
+            if not keep_stdin_open:
+                proc.stdin.close()
+            return proc
 
-            if not use_portal_stdin:
+        try:
+            if gw_session:
+                # ── Reprise : tunnel direct avec le cookie de session ────────
+                phase = 'cookie'
+                self._oc_phase = phase
+                extra = ([f'--resolve={gw_session["resolve"]}']
+                         if gw_session.get('resolve') else [])
+                _spawn(_tunnel_cmd(gw_session.get('url') or target_host, extra),
+                       _cookie_with_preferred_ip(
+                           gw_session['cookie'], gw_session.get('client_ip')))
+            elif not use_portal_stdin:
                 # ── Cas nominal : cookie gateway direct ──────────────────────
-                self.openconnect_proc.stdin.write(cookie_value + '\n')
-                self.openconnect_proc.stdin.flush()
-                self.openconnect_proc.stdin.close()
+                # 1er temps : authentification seule. openconnect imprime à la
+                # sortie COOKIE=/HOST=/CONNECT_URL=/FINGERPRINT=/RESOLVE= sur
+                # stdout (jamais journalisés : le cookie est un secret).
+                phase = 'auth'
+                self._oc_phase = phase
+                _spawn(base_cmd + auth_opts + ['--authenticate', target_host],
+                       cookie_value)
             else:
                 # ── Mode portail interactif ──────────────────────────────────
                 # Envoyer le cookie IMMÉDIATEMENT pour éviter le blocage :
                 # openconnect appelle fgets(stdin) avant de produire du stdout,
                 # ce qui deadlockerait si stdin est vide.
-                self._log(f'  stdin[1] : {cookie_field}')
-                self.openconnect_proc.stdin.write(cookie_value + '\n')
-                self.openconnect_proc.stdin.flush()
+                phase = 'single'
+                self._oc_phase = phase
                 # stdin reste OUVERT pour la sélection du gateway plus tard
+                _spawn(base_cmd + auth_opts + hip_opts + [target_host],
+                       cookie_value, keep_stdin_open=True)
+                self._log(f'  stdin[1] : {cookie_field}')
+
+            # ── Session passerelle (cookie de reprise) ───────────────────────
+            _auth_result     = {}      # COOKIE/HOST/… imprimés par --authenticate
+            _gw_candidate    = dict(gw_session) if gw_session else None
+            _portal_gw_host  = ''      # gateway choisi en mode portail
+            _cookie_rejected = False
 
             # ── État pour le mode portail interactif ─────────────────────────
             import re as _re
@@ -8690,9 +9175,55 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
             _auth_error_hint = ''
             self._vpn_dns_servers = []
 
-            for line in self.openconnect_proc.stdout:
+            def _oc_output():
+                """Lignes openconnect ; enchaîne --authenticate → tunnel."""
+                nonlocal phase, _gw_candidate
+                while True:
+                    proc = self.openconnect_proc
+                    for raw in proc.stdout:
+                        yield raw
+                    proc.wait()
+                    cookie = _auth_result.get('COOKIE', '')
+                    if (phase != 'auth' or self._cancel_requested
+                            or proc.returncode != 0 or not cookie):
+                        return
+                    url = _auth_result.get('CONNECT_URL') or ''
+                    host = (urlparse(url).netloc if url else ''
+                            ) or _auth_result.get('HOST') or target_host
+                    resolve = _auth_result.get('RESOLVE', '')
+                    fingerprint = _auth_result.get('FINGERPRINT', '')
+                    _gw_candidate = {
+                        'cookie': cookie, 'host': host, 'url': url or host,
+                        'resolve': resolve,
+                        'desc': gateway_desc or host, 'os_type': os_type,
+                        'user_agent': user_agent, 'username': username,
+                        'ts': _time_mod.time(),
+                    }
+                    self._log('  [Session] Authentification passerelle OK '
+                              '— ouverture du tunnel (cookie de session)')
+                    extra = []
+                    if fingerprint:
+                        extra.append(f'--servercert={fingerprint}')
+                    if resolve:
+                        extra.append(f'--resolve={resolve}')
+                    phase = 'tunnel'
+                    self._oc_phase = phase
+                    proc = _spawn(_tunnel_cmd(url or host, extra), cookie)
+                    if self._cancel_requested:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+
+            for line in _oc_output():
                 line = line.rstrip()
-                self._log(line)
+                if phase == 'auth':
+                    m = _re.match(r"^(COOKIE|HOST|CONNECT_URL|FINGERPRINT"
+                                  r"|RESOLVE)='?(.*?)'?$", line)
+                    if m:
+                        _auth_result[m.group(1)] = m.group(2)
+                        continue
+                self._log(_mask_secrets(line))
 
                 if line.startswith('Got DNS server '):
                     dns_srv = line.split('Got DNS server ', 1)[1].strip()
@@ -8859,6 +9390,9 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                             # NE PAS fermer stdin : le gateway peut demander
                             # des credentials supplémentaires
                             _gateway_selected = True
+                            _portal_gw_host = next(
+                                (_gw['hostname'] for _gw in _gateway_list
+                                 if _gw['description'] == _selected), '')
 
                     # 4. Fallback : prompt GATEWAY: [opt1|opt2]:
                     elif ('GATEWAY:' in line and '[' in line
@@ -8877,6 +9411,9 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                             self.openconnect_proc.stdin.write(_sel + '\n')
                             self.openconnect_proc.stdin.flush()
                             _gateway_selected = True
+                            _portal_gw_host = next(
+                                (_gw['hostname'] for _gw in _gateway_list
+                                 if _gw['description'] == _sel), '')
 
                     # 5. Credentials gateway (après sélection) :
                     #    openconnect redemande un cookie pour le gateway on-prem.
@@ -8918,6 +9455,24 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                     m = _re.search(r'--client-ip\s+(\S+)', line)
                     if m:
                         self._log(f'  [HIP] IP client transmise : {m.group(1)}')
+                    # Mode portail : seule source du cookie de session
+                    # passerelle (pas de --authenticate séparé).
+                    m = _re.search(r'--cookie\s+(\S+)', line)
+                    if (m and phase == 'single' and _portal_gw_host
+                            and 'authcookie=' in m.group(1)):
+                        _gw_candidate = {
+                            'cookie': m.group(1), 'host': _portal_gw_host,
+                            'url': _portal_gw_host, 'resolve': '',
+                            'desc': gateway_desc or _portal_gw_host,
+                            'os_type': os_type, 'user_agent': user_agent,
+                            'username': username, 'ts': _time_mod.time(),
+                        }
+                        if self._tunnel_up_handled and not self._gw_session:
+                            _gw_candidate['client_ip'] = _configured_ip
+                            self._gw_session = _gw_candidate
+                            _gateway_session_save(
+                                self.config.get('server') or target_host,
+                                _gw_candidate, log_fn=self._log)
 
                 if line.startswith('[HIP-WRAPPER] Rapport généré'):
                     # Le wrapper vient d'écrire le XML — l'afficher en entier
@@ -9028,22 +9583,37 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                         _configured_ip = ''
 
                 # ── Tunnel connecté (une seule fois) ─────────────────────
-                if (not getattr(self, '_tunnel_up_handled', False)
+                if (phase != 'auth'
+                        and not getattr(self, '_tunnel_up_handled', False)
                         and any(kw in line for kw in
                        ('Tunnel is up', 'ESP tunnel connected', 'DTLS connected',
                         'Connected as', 'assigned address', 'Configured as',
                         'SSL connected and ESP unsuccessful'))):
                     self._tunnel_up_handled = True
                     self._set_state('connected', subtitle=gateway_desc or target_host)
+                    portal_server = self.config.get('server') or target_host
                     # Persister le token RÉUTILISABLE (portal-userauthcookie)
                     # rattaché au portail config, pas au FQDN gateway cloud.
                     if getattr(self, '_last_auth_info', None):
-                        portal_server = (
-                            self.config.get('server') or target_host)
                         _save_session_token(
                             portal_server, dict(self._last_auth_info),
                             log_fn=self._log)
-                        self._reconnect_count = 0
+                    self._reconnect_count = 0
+                    self._oc_reconnecting = False
+                    self._tunnel_up_mono = _time_mod.monotonic()
+                    self._gw_hard_failures = 0
+                    if _gw_candidate:
+                        _gw_candidate['client_ip'] = (
+                            _configured_ip or _gw_candidate.get('client_ip')
+                            or '')
+                        self._gw_session = _gw_candidate
+                        if (_gateway_session_save(portal_server, _gw_candidate,
+                                                  log_fn=self._log)
+                                and phase != 'cookie'):
+                            self._log(
+                                '  [Session] Session passerelle mémorisée : '
+                                'reprise sans SAML après veille ou '
+                                'changement de réseau')
                     oc_pid = (self.openconnect_proc.pid
                               if self.openconnect_proc else None)
                     _save_vpn_state(
@@ -9051,14 +9621,16 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                         iface=self._oc_iface(),
                         client_ip=_configured_ip,
                         pid=oc_pid)
-                    # Mémoriser le mode et l'OS qui fonctionnent
-                    if use_portal_stdin:
-                        self._remember_mode_for_server('portal')
-                    else:
-                        self._remember_mode_for_server('gateway')
-                    effective_os = OS_TO_CLIENTOS.get(os_type, '')
-                    if effective_os:
-                        self._remember_os_for_server(effective_os)
+                    # Mémoriser le mode et l'OS qui fonctionnent (une reprise
+                    # par cookie n'apprend rien de nouveau).
+                    if phase != 'cookie':
+                        if use_portal_stdin:
+                            self._remember_mode_for_server('portal')
+                        else:
+                            self._remember_mode_for_server('gateway')
+                        effective_os = OS_TO_CLIENTOS.get(os_type, '')
+                        if effective_os:
+                            self._remember_os_for_server(effective_os)
                     self._os_retry_list = []
                     if self.config.get('force_vpn_dns', True) and not _dns_forced:
                         # Lancer en arrière-plan pour ne pas bloquer la lecture stdout.
@@ -9079,12 +9651,59 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                         })
                     self._verify_hip_after_connect(target_host)
 
+                if any(kw in line for kw in _OC_REJECTED_MARKERS):
+                    _cookie_rejected = True
+
+                # ── Reconnexion interne d'openconnect (veille, réseau) ───
+                if self._tunnel_up_handled and phase != 'auth':
+                    if any(kw in line for kw in _OC_RECONNECT_MARKERS):
+                        if not self._oc_reconnecting:
+                            self._oc_reconnecting = True
+                            self._log('  [Itinérance] openconnect relance '
+                                      'le tunnel…')
+                            self._netmon_note_event(
+                                'reconnexion openconnect', network=False)
+                    elif (self._oc_reconnecting and any(
+                            kw in line for kw in _OC_RECOVERED_MARKERS)):
+                        self._oc_reconnecting = False
+                        self._log('  [Itinérance] ✔ Tunnel rétabli par '
+                                  'openconnect')
+                        threading.Thread(target=self._reassert_vpn_dns,
+                                         daemon=True).start()
+
             self.openconnect_proc.wait()
+            rc = self.openconnect_proc.returncode
+            tunnel_was_up = self._tunnel_up_handled
+            self._oc_reconnecting = False
+            if rc == 2:
+                # -EPERM : « Cookie was rejected by server ».
+                _cookie_rejected = True
+
+            if not self._cancel_requested and phase == 'cookie' \
+                    and not tunnel_was_up:
+                self._on_gateway_resume_failed(
+                    rejected=_cookie_rejected, rc=rc,
+                    hint=_auth_error_hint)
+                return
 
             if not self._cancel_requested:
-                if self.state == 'connected':
-                    self._log('Connexion VPN terminée.')
+                if tunnel_was_up:
+                    self._log(f'Connexion VPN terminée (code {rc}).')
                     self._restore_dns_routes()
+                    if _cookie_rejected and self._gw_session:
+                        self._log('  [Session] La passerelle a refusé la '
+                                  'session (expirée ou fermée côté serveur).')
+                        self._forget_gateway_session()
+                    if self._gw_session:
+                        _gateway_session_save(
+                            self.config.get('server') or target_host,
+                            self._gw_session)
+                        # Backoff remis à zéro seulement si le tunnel a tenu
+                        # (sinon boucle de reconnexion toutes les 2 s).
+                        if _time_mod.monotonic() - self._tunnel_up_mono >= 60:
+                            self._gw_recovery_attempt = 0
+                        self._schedule_gateway_recovery('Tunnel interrompu')
+                        return
                     reconnect_count = getattr(self, '_reconnect_count', 0)
                     if reconnect_count < 3:
                         self._reconnect_count = reconnect_count + 1
@@ -9093,8 +9712,9 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
                             f'{self._reconnect_count}/3 dans 5s…')
                         self._set_state('connecting',
                                         subtitle=f'Reconnexion…')
-                        _time_mod.sleep(5)
-                        if not self._cancel_requested:
+                        gen = self._recovery_gen
+                        if (self._wait_unless_cancelled(gen, 5)
+                                and self._wait_for_uplink(gen)):
                             GLib.idle_add(self._start_connect)
                         return
                     self._set_state('disconnected')
@@ -9143,12 +9763,413 @@ headerbar button:hover { color: #e6edf3; background: #30363d; }
             self._log(f'Erreur openconnect : {e}')
             self._set_state('error', error_msg=str(e)[:60])
         finally:
-            if self._hip_wrapper_tmp:
+            # Une reprise a pu lancer un nouvel appel entre-temps : ne
+            # nettoyer que ce qui appartient à celui-ci.
+            if _my_hip_wrapper:
                 try:
-                    os.unlink(self._hip_wrapper_tmp)
+                    os.unlink(_my_hip_wrapper)
                 except Exception:
                     pass
+            if self._hip_wrapper_tmp == _my_hip_wrapper:
                 self._hip_wrapper_tmp = None
+            if self._oc_call is _my_call:
+                self._oc_phase = None
+
+    # ── Itinérance : reprise de session, surveillance réseau ───────────────
+
+    def _oc_signal(self, sig, proc=None, adopted_pid=None):
+        """Envoie SIG<sig> à l'openconnect piloté par l'app (sudo -n pkill).
+
+        Cible le fils du sudo lancé par l'app (ou le parent du PID adopté)
+        pour ne pas toucher un openconnect tiers (NetworkManager…).
+          HUP  : sortie sans logout.esp (session passerelle conservée)
+          USR2 : reconnexion immédiate (sockets neuves sur le réseau courant)
+        """
+        proc = proc or self.openconnect_proc
+        parent = None
+        if proc is not None and proc.poll() is None:
+            parent = proc.pid
+        else:
+            pid = adopted_pid or self._existing_vpn_pid
+            if pid and _pid_alive(pid):
+                parent = _ppid_of(pid)
+        if not parent:
+            return False
+        try:
+            r = subprocess.run(
+                ['sudo', '-n', 'pkill', f'-{sig}', '-P', str(parent),
+                 '-x', 'openconnect'],
+                capture_output=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _detach_openconnect(self, proc=None, adopted_pid=None):
+        """Coupe le tunnel par SIGHUP (pas de logout.esp) et vérifie l'arrêt."""
+        if (not self._oc_signal('HUP', proc=proc, adopted_pid=adopted_pid)
+                and proc is not None):
+            try:
+                proc.send_signal(signal.SIGHUP)   # relayé par sudo
+            except Exception:
+                pass
+        deadline = _time_mod.monotonic() + 8
+        while _time_mod.monotonic() < deadline:
+            if proc is not None:
+                if proc.poll() is not None:
+                    return
+            elif not adopted_pid or not _pid_alive(adopted_pid):
+                return
+            _time_mod.sleep(0.25)
+        self._log('  ⚠ openconnect ne répond pas à SIGHUP — arrêt forcé '
+                  '(session passerelle fermée).')
+        self._kill_all_openconnect()
+        self._forget_gateway_session()
+
+    def _forget_gateway_session(self, server=None):
+        self._gw_session = None
+        _gateway_session_clear(server or self.config.get('server', ''),
+                               log_fn=self._log)
+
+    def _wait_unless_cancelled(self, gen, seconds):
+        """Attend `seconds` s ; False si annulé ou remplacé entre-temps."""
+        end = _time_mod.monotonic() + seconds
+        while True:
+            if (self._quitting or self._cancel_requested
+                    or gen != self._recovery_gen):
+                return False
+            left = end - _time_mod.monotonic()
+            if left <= 0:
+                return True
+            _time_mod.sleep(min(0.5, left))
+
+    def _wait_for_uplink(self, gen):
+        """Attend un accès réseau physique. False seulement si annulé."""
+        waiting = False
+        while _uplink_fingerprint() is None:
+            if not waiting:
+                waiting = True
+                self._log('  [Itinérance] Aucun accès réseau — en attente…')
+                self._set_state('connecting', subtitle='En attente du réseau…')
+            if not self._wait_unless_cancelled(gen, 2):
+                return False
+        if waiting:
+            self._log(f'  [Itinérance] Accès réseau : '
+                      f'{_describe_uplink(_uplink_fingerprint())}')
+            # Laisser DHCP/DNS se stabiliser sur le nouveau lien.
+            return self._wait_unless_cancelled(gen, 2)
+        return self._wait_unless_cancelled(gen, 0)
+
+    def _schedule_gateway_recovery(self, reason):
+        """Relance le tunnel avec la session passerelle (backoff, sans SAML)."""
+        gen = self._recovery_gen
+        self._set_state('connecting', subtitle='Reconnexion automatique…')
+        threading.Thread(target=self._gateway_recovery_worker,
+                         args=(gen, reason), daemon=True).start()
+
+    def _gateway_recovery_worker(self, gen, reason):
+        self._gw_recovery_attempt += 1
+        attempt = self._gw_recovery_attempt
+        delay = _GW_RECOVERY_DELAYS[
+            min(attempt, len(_GW_RECOVERY_DELAYS)) - 1]
+        self._log(f'  [Itinérance] {reason} — reprise de la session '
+                  f'passerelle sans SAML dans {delay} s '
+                  f'(tentative {attempt})…')
+        if not self._wait_unless_cancelled(gen, delay):
+            return
+        if not self._wait_for_uplink(gen):
+            return
+        gw = self._gw_session
+        server = self.config.get('server', '')
+        if not gw:
+            GLib.idle_add(self._start_connect)
+            return
+        self._set_state('connecting', subtitle='Reconnexion automatique…')
+        if (self.config.get('connection_mode', 'auto') == 'auto'
+                and _is_on_internal_network(server, log_fn=self._log)):
+            self._log('  [Itinérance] Réseau interne détecté — bascule en '
+                      'mode interne (session passerelle conservée)')
+            if gen == self._recovery_gen and not self._cancel_requested:
+                GLib.idle_add(
+                    lambda: self._start_connect(use_gateway_session=False))
+            return
+        if gen != self._recovery_gen or self._cancel_requested:
+            return
+        self._connect_with_gateway_session(gw)
+
+    def _on_gateway_resume_failed(self, rejected, rc, hint=''):
+        """Échec d'une reprise par cookie : réessayer ou repasser par l'auth."""
+        server = self.config.get('server', '')
+        gw = self._gw_session
+        if rejected or not gw:
+            if rejected:
+                self._log('  [Session] Session passerelle refusée (expirée '
+                          'ou fermée côté serveur) → authentification normale')
+            self._forget_gateway_session(server)
+            GLib.idle_add(self._start_connect)
+            return
+        # Passerelle joignable mais échec quand même (HIP, config…) :
+        # ne pas boucler indéfiniment sur un cookie peut-être mort.
+        if _uplink_fingerprint() is not None and _tcp_reachable(
+                gw.get('host', '')):
+            self._gw_hard_failures += 1
+        if self._gw_hard_failures >= _GW_MAX_HARD_FAILURES:
+            self._log(f'  [Session] Reprise impossible après '
+                      f'{self._gw_hard_failures} échecs (code {rc}'
+                      f'{", " + hint if hint else ""}) → authentification '
+                      f'normale')
+            self._forget_gateway_session(server)
+            GLib.idle_add(self._start_connect)
+            return
+        self._schedule_gateway_recovery(f'Échec de reprise (code {rc})')
+
+    def _vpn_tunnel_iface(self):
+        return (self._dns_forced_iface or self._iface_by_ip(self._vpn_client_ip)
+                or self._oc_iface())
+
+    def _probe_tunnel(self):
+        """True si un DNS joint via le tunnel répond, False sinon, None si
+        aucun DNS du tunnel n'est testable."""
+        iface = self._vpn_tunnel_iface()
+        if not iface:
+            return None
+        servers = []
+        for s in self._get_iface_dns_servers(iface):
+            try:
+                ipaddress.IPv4Address(s)
+            except ValueError:
+                continue
+            if _route_dev(s) == iface:
+                servers.append(s)
+        if not servers:
+            return None
+        name = self.config.get('server', '') or 'localhost'
+        return any(_dns_server_responds(s, name, timeout=2.0)
+                   for s in servers[:2])
+
+    def _reassert_vpn_dns(self, quiet=False):
+        """Ré-applique le DNS du tunnel après une reprise et purge l'état
+        de systemd-resolved (cache négatif, niveau de fonctionnalités des
+        serveurs dégradé pendant la coupure)."""
+        if not self._dns_reassert_lock.acquire(blocking=False):
+            return
+        try:
+            if not self.config.get('force_vpn_dns', True):
+                return
+            tool, path = _detect_dns_tool()
+            if tool not in ('resolvectl', 'systemd-resolve') \
+                    or not can_sudo_resolvectl():
+                return
+            iface = self._vpn_tunnel_iface()
+            if not iface or not os.path.exists(f'/sys/class/net/{iface}'):
+                return
+            fixed = []
+            if not self._get_iface_dns_servers(iface):
+                server = self.config.get('server', '')
+                manual = self.config.get('vpn_dns_servers', '')
+                dns = [s.strip() for s in manual.replace(',', ' ').split()
+                       if s.strip()]
+                if not dns and server:
+                    dns = self.config.get('learned_vpn_dns', {}).get(
+                        server, '').split()
+                if not dns:
+                    dns = list(self._vpn_dns_servers)
+                if dns and self._run_resolvectl(
+                        ['dns', iface, *dns]).returncode == 0:
+                    fixed.append(f'DNS {" ".join(dns)}')
+            try:
+                out = subprocess.run([path, 'status', iface],
+                                     capture_output=True, text=True,
+                                     timeout=5).stdout
+            except Exception:
+                out = ''
+            m = re.search(r'DNS Domain:\s*(.+)', out)
+            if '~.' not in (m.group(1).split() if m else []):
+                if self._run_resolvectl(['domain', iface, '~.']).returncode == 0:
+                    fixed.append('domaine ~.')
+            # Nouveaux liens (changement de réseau) : mémoriser leur valeur
+            # d'origine avant de les forcer à « no », pour la restauration.
+            for link, val in self._parse_default_routes().items():
+                self._dns_route_snapshot.setdefault(link, val)
+            self._dns_forced_iface = iface
+            try:
+                self._apply_default_routes_for_vpn(iface)
+            except Exception:
+                pass
+            self._run_resolvectl(['reset-server-features'])
+            self._run_resolvectl(['flush-caches'])
+            if not quiet or fixed:
+                self._log(f'  [DNS] ✔ DNS du tunnel ré-appliqué ({iface}'
+                          f'{" : " + ", ".join(fixed) if fixed else ""}) '
+                          f'— cache DNS purgé')
+        except Exception as e:
+            self._log(f'  [DNS] ⚠ Ré-application DNS échouée : {e}')
+        finally:
+            self._dns_reassert_lock.release()
+
+    # ── Surveillance réseau (veille, changement d'accès) ───────────────────
+
+    _NETMON_INTERVAL = 3
+
+    def _vpn_mode_for_netmon(self):
+        """'tunnel' | 'adopted' | 'internal' | None (rien à surveiller)."""
+        if self.state != 'connected':
+            return None
+        if self._internal_session:
+            return 'internal'
+        proc = self.openconnect_proc
+        if proc is not None and proc.poll() is None and self._tunnel_up_handled:
+            return 'tunnel'
+        if self._existing_vpn_pid and _pid_alive(self._existing_vpn_pid):
+            return 'adopted'
+        return None
+
+    def _netmon_note_event(self, reason, network=True):
+        """Enregistre un événement à traiter par la boucle de surveillance."""
+        p = self._netmon_pending
+        if p and not network:
+            return
+        now = _time_mod.monotonic()
+        self._netmon_pending = {
+            'reason': reason, 'network': network, 'since': now,
+            'uplink_since': None, 'nudges': 0, 'last_nudge': 0.0,
+            'lan': None,
+        }
+
+    def _netmon_loop(self):
+        """Détecte sortie de veille et changement d'accès réseau, puis
+        s'assure que le tunnel (ou la session interne) suit."""
+        last_fp = _uplink_fingerprint()
+        last_susp = _suspended_seconds()
+        last_touch = _time_mod.monotonic()
+        while not self._quitting:
+            _time_mod.sleep(self._NETMON_INTERVAL)
+            try:
+                fp = _uplink_fingerprint()
+                susp = _suspended_seconds()
+                reasons = []
+                if susp - last_susp > 5:
+                    reasons.append(
+                        f'sortie de veille ({int(susp - last_susp)} s)')
+                if fp != last_fp:
+                    if fp is None:
+                        reasons.append(f'perte de l\'accès réseau '
+                                       f'({_describe_uplink(last_fp)})')
+                    else:
+                        reasons.append(f'accès réseau : '
+                                       f'{_describe_uplink(fp)}')
+                last_fp, last_susp = fp, susp
+                mode = self._vpn_mode_for_netmon()
+                if reasons and mode:
+                    self._log(f'  [Itinérance] {", ".join(reasons)}')
+                    self._netmon_note_event(', '.join(reasons))
+                if mode in ('tunnel', 'adopted') and self._gw_session \
+                        and _time_mod.monotonic() - last_touch > 600:
+                    # Session toujours active : repousser son expiration locale.
+                    last_touch = _time_mod.monotonic()
+                    _gateway_session_save(self.config.get('server', ''),
+                                          self._gw_session)
+                self._netmon_step(mode, fp)
+            except Exception as e:
+                self._log(f'  [Itinérance] Erreur surveillance réseau : {e}')
+
+    def _netmon_clear(self, p):
+        if self._netmon_pending is p:
+            self._netmon_pending = None
+
+    def _netmon_nudge(self, p, now):
+        """Relance openconnect sans attendre son backoff (jusqu'à 100 s)."""
+        p['nudges'] += 1
+        p['last_nudge'] = now
+        self._oc_reconnecting = True
+        self._log('  [Itinérance] Tunnel inopérant → reconnexion immédiate '
+                  'd\'openconnect (SIGUSR2)')
+        if not self._oc_signal('USR2'):
+            self._log('  [Itinérance] ⚠ Signal à openconnect impossible '
+                      '(sudo -n pkill)')
+
+    def _netmon_step(self, mode, fp):
+        p = self._netmon_pending
+        if p is None:
+            return
+        if mode is None:
+            self._netmon_clear(p)
+            return
+        now = _time_mod.monotonic()
+        if fp is None:
+            p['uplink_since'] = None
+            return
+        if p['uplink_since'] is None:
+            p['uplink_since'] = now
+        up_for = now - p['uplink_since']
+        age = now - p['since']
+        server = self.config.get('server', '')
+        auto = self.config.get('connection_mode', 'auto') == 'auto'
+
+        if mode == 'internal':
+            if up_for < 3:
+                return
+            self._netmon_clear(p)
+            if not auto or not server:
+                return
+            if _is_on_internal_network(server, log_fn=self._log):
+                self._log('  [Itinérance] Toujours sur le réseau interne — '
+                          'session interne conservée')
+                return
+            if self.state != 'connected' or not self._internal_session:
+                return
+            self._log('  [Itinérance] Réseau interne quitté → bascule en '
+                      'mode tunnel')
+            stop_ev = self._hip_stop_event
+            if stop_ev:
+                stop_ev.set()
+            self._internal_session = None
+            GLib.idle_add(self._start_connect)
+            return
+
+        if up_for < 2:
+            return
+        first_due = 2 if p['network'] else 20
+        healthy = self._probe_tunnel()
+        if healthy:
+            self._netmon_clear(p)
+            self._oc_reconnecting = False
+            self._log(f'  [Itinérance] ✔ Tunnel opérationnel ({p["reason"]})')
+            self._reassert_vpn_dns(quiet=not p['network'])
+            return
+
+        if healthy is None:
+            # Aucun DNS testable via le tunnel : se fier à openconnect.
+            if ((not self._oc_reconnecting and up_for >= 10)
+                    or (p['nudges'] and now - p['last_nudge'] >= 15)):
+                self._netmon_clear(p)
+                self._reassert_vpn_dns(quiet=not p['network'])
+            elif (self._oc_reconnecting and not p['nudges']
+                  and up_for >= first_due):
+                self._netmon_nudge(p, now)
+            return
+
+        # Arrivée sur le LAN avec un tunnel qui ne passe plus : le couper
+        # (SIGHUP, sans logout) ; la reprise basculera en mode interne.
+        if (mode == 'tunnel' and auto and server and p['network']
+                and up_for >= 15 and p['lan'] is None):
+            p['lan'] = _is_on_internal_network(server, log_fn=self._log)
+            if p['lan']:
+                self._netmon_clear(p)
+                self._log('  [Itinérance] Réseau interne détecté et tunnel '
+                          'inopérant → arrêt du tunnel')
+                self._oc_signal('HUP')
+                return
+
+        if ((not p['nudges'] and up_for >= first_due)
+                or (p['nudges'] == 1 and now - p['last_nudge'] >= 45)):
+            self._netmon_nudge(p, now)
+            return
+
+        if age >= 180:
+            self._netmon_clear(p)
+            self._log('  [Itinérance] ⚠ Tunnel toujours inopérant après '
+                      '3 min — openconnect poursuit ses tentatives ; '
+                      'reprise automatique s\'il abandonne.')
 
     # ── Utilitaires ────────────────────────────────────────────────────────
 
