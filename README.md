@@ -2,6 +2,8 @@
 
 A modern GTK3 VPN client for **Palo Alto GlobalProtect** on Linux, built with OpenConnect and SAML/SSO authentication.
 
+![GP Connect](docs/screenshot.png)
+
 ## Features
 
 - **SAML/SSO authentication** via integrated WebView or external browser (Chrome/Firefox)
@@ -18,31 +20,30 @@ A modern GTK3 VPN client for **Palo Alto GlobalProtect** on Linux, built with Op
 ## Requirements
 
 - **Ubuntu 24.04+** (tested on 24.04, 24.10, 25.04, 25.10)
-- Python 3.10+
-- GTK 3
-- OpenConnect
-- vpnc-scripts
+- `sudo` (to install system packages and the `.deb`)
+- Internet access on first build (downloads [gp-saml-gui](https://github.com/dlenski/gp-saml-gui) as SAML fallback)
+
+All other dependencies (Python/GTK, OpenConnect, WebKit2, `git`, …) are installed by `./install.sh`.
 
 ## Installation
-
-### From .deb package (recommended)
-
-```bash
-# Build the package
-./build_deb.sh
-
-# Install
-sudo dpkg -i dist/gp-connect_*.deb
-
-# If dependencies are missing
-sudo apt-get install -f
-```
-
-### Local install (no root required for install)
 
 ```bash
 ./install.sh
 ```
+
+This installs system dependencies, builds `dist/gp-connect_<version>_<arch>.deb`, and installs it with `apt`.
+
+Other modes:
+
+```bash
+./install.sh --deps      # system packages only
+./install.sh --build     # dependencies + .deb (do not install)
+./install.sh --install   # install an already-built package from dist/
+./install.sh --local     # copy into ~/.local without a .deb
+```
+
+Uninstall a `.deb` install with `gp-connect-uninstall` or `sudo apt remove --purge gp-connect`.
+A `--local` install is removed with `./uninstall.sh`.
 
 ## Quick Start
 

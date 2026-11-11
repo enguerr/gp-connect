@@ -61,9 +61,6 @@ hip_template.xml
 core
 core.*
 
-# ── Captures pouvant montrer un réseau interne ─────────────────────
-docs/screenshot.png
-
 # ── OS ─────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
